@@ -1,4 +1,4 @@
-# GovSync
+# iSwabe
 
 **Financial Discrepancy Analyzer** — a Windows/macOS desktop app for comparing government payroll and remittance data across sources.
 
@@ -9,7 +9,7 @@
 
 Get the latest installer from the [Releases](../../releases) page:
 
-- Windows: `GovSync-Setup-<version>.exe`
+- Windows: `iSwabe-Setup-<version>.exe`
 - macOS: `.dmg` (Intel and Apple Silicon)
 
 The app runs fully offline after installation — no server, no internet connection required — and checks for updates automatically.
