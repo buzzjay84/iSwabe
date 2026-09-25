@@ -1,0 +1,170 @@
+name: Build Release from private source
+
+# Lives in the PUBLIC release repo (buzzjay84/iSwabe) as
+# .github/workflows/build-from-private.yml. A copy is kept in the private
+# source at .github/release-repo/build-from-private.yml. Actions on a public
+# repository are free, so the installers are built here. The private source
+# (jaybhee84/iSwabe) is checked out read-only with a deploy key, type-checked,
+# built, and the installers are published to THIS repo's Releases, which is
+# the update source the installed apps read.
+#
+# Started by watch-private.yml when the private source's version changes, or
+# by hand:
+#   gh workflow run build-from-private.yml -R buzzjay84/iSwabe -f tag=v1.0.5 -f ref=v1.0.5
+#
+# One tag, one release: create-release makes a single draft release first; the
+# Windows and macOS builds run in parallel and each uploads its own files into
+# that same release; publish-release makes it public only after both succeed.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release to publish, e.g. v1.0.5 (must equal package.json version at ref)'
+        required: true
+        type: string
+      ref:
+        description: 'Branch, tag or commit of the private source to build (default: the tag)'
+        required: false
+        type: string
+  repository_dispatch:
+    types: [build-release]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-release-${{ github.event.inputs.tag || github.event.client_payload.tag }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: jaybhee84/iSwabe
+  RELEASE_TAG: ${{ github.event.inputs.tag || github.event.client_payload.tag }}
+  SOURCE_REF: ${{ github.event.inputs.ref || github.event.client_payload.ref || github.event.inputs.tag || github.event.client_payload.tag }}
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Tag must look like vX.Y.Z
+        shell: bash
+        run: |
+          if ! [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::'$RELEASE_TAG' is not a release tag like v1.0.0" >&2
+            exit 1
+          fi
+
+      # Read-only deploy key for the private repo. The key is never printed and no credentials are
+      # left in the workspace. Logs of a public repo are public, so nothing here echoes source.
+      - name: Check out private source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_REF }}
+          ssh-key: ${{ secrets.PRIVATE_SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Verify tag matches package version
+        shell: bash
+        run: |
+          PACKAGE_VERSION=$(node -p "require('./package.json').version")
+          if [ "$RELEASE_TAG" != "v$PACKAGE_VERSION" ]; then
+            echo "::error::Tag $RELEASE_TAG must match package.json version $PACKAGE_VERSION." >&2
+            exit 1
+          fi
+
+      - run: npm ci
+      - run: npx tsc --noEmit -p .
+      - run: npm run lint
+        continue-on-error: true
+
+  create-release:
+    needs: quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create the one draft release all builds upload into
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          if gh release view "$RELEASE_TAG" --repo "${{ github.repository }}" --json isDraft --jq .isDraft 2>/dev/null | grep -q false; then
+            echo "::error::$RELEASE_TAG is already published; bump the version for a new release." >&2
+            exit 1
+          elif gh release view "$RELEASE_TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Draft release $RELEASE_TAG exists; the builds will upload into it."
+          else
+            gh release create "$RELEASE_TAG" --repo "${{ github.repository }}" --draft --title "$RELEASE_TAG" --generate-notes
+          fi
+
+  build-windows:
+    needs: create-release
+    runs-on: windows-latest
+    steps:
+      - name: Check out private source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_REF }}
+          ssh-key: ${{ secrets.PRIVATE_SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - run: npm ci
+      - run: npm run dist:win
+
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: gh release upload "$RELEASE_TAG" release/*.exe release/*.exe.blockmap release/latest.yml --repo "${{ github.repository }}" --clobber
+
+  # No native modules (the database uses node:sqlite), so one macOS runner
+  # builds both the Intel and Apple Silicon DMGs (dist:mac passes --x64 --arm64).
+  build-mac:
+    needs: create-release
+    runs-on: macos-latest
+    steps:
+      - name: Check out private source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_REF }}
+          ssh-key: ${{ secrets.PRIVATE_SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - run: npm ci
+
+      # No Apple certificate: unsigned, unnotarized DMG (right-click > Open the first time).
+      - name: Build the DMGs
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+        run: npm run dist:mac
+
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: gh release upload "$RELEASE_TAG" release/*.dmg release/*.zip --repo "${{ github.repository }}" --clobber
+
+  publish-release:
+    needs: [build-windows, build-mac]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish the GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "$RELEASE_TAG" --draft=false --latest --repo "${{ github.repository }}"
